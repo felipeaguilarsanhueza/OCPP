@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.coverage*
+
+# Envs
+.env
+venv/
+.venv/
+ENV/
+env/
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Build
+dist/
+build/
+*.egg-info/
+
+# Local data
+ocpp.db
+
+
