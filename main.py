@@ -15,24 +15,11 @@ ocpp.messages._skip_schema_validation = True
 import asyncio, logging, threading, os
 import uvicorn, websockets, ocpp
 
-from fastapi import FastAPI, Depends
-from fastapi.middleware.cors import CORSMiddleware
-
 from database.db import engine
 from database.models import Base
 from core.ocpp_handler       import ChargePoint
 from core.connection_manager import manager
 from core.auth               import get_current_user
-from api.middleware.rate_limit import limiter_middleware
-
-# Routers
-from api.routes.auth       import router as auth_router
-from api.routes.users      import router as users_router
-from api.routes.payments   import router as payments_router
-from api.routes.charging   import router as charging_router
-from api.routes.admin      import router as admin_router
-from api.routes.facilities import router as facilities_router
-from api.routes.connectors import router as connectors_router
 
 # ---- Logging & DB
 logging.basicConfig(level=logging.DEBUG,
@@ -42,46 +29,60 @@ logging.getLogger("passlib.handlers.bcrypt").setLevel(logging.ERROR)
 
 Base.metadata.create_all(bind=engine)
 
-# ---- FastAPI
-api_app = FastAPI(title="OCPP Server API", version="1.0")
+RUN_MODE = os.getenv("RUN_MODE", "both").lower()
 
-# 1) CORS — antes de cualquier router
-api_app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],      # En prod pon tu dominio
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Configuración de FastAPI solo si no estamos en modo exclusivamente WS
+if RUN_MODE != "ws":
+    from fastapi import FastAPI, Depends
+    from fastapi.middleware.cors import CORSMiddleware
+    from api.middleware.rate_limit import limiter_middleware
+    # Routers
+    from api.routes.auth       import router as auth_router
+    from api.routes.users      import router as users_router
+    from api.routes.payments   import router as payments_router
+    from api.routes.charging   import router as charging_router
+    from api.routes.admin      import router as admin_router
+    from api.routes.facilities import router as facilities_router
+    from api.routes.connectors import router as connectors_router
 
-# 2) Rate-limit
-api_app.middleware("http")(limiter_middleware)
+    # ---- FastAPI
+    api_app = FastAPI(title="OCPP Server API", version="1.0")
 
-# 3) Auth: register, login, me…
-api_app.include_router(auth_router, prefix="/auth", tags=["Auth"])
+    # 1) CORS — antes de cualquier router
+    api_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],      # En prod pon tu dominio
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-# 4) Facilities **públicas**:
-#    Los GET de list/detail NO piden token.
-api_app.include_router(
-    facilities_router,
-    prefix="/facilities",
-    tags=["Facilities"],
-    # <<< no dependencies aquí >>>
-)
+    # 2) Rate-limit
+    api_app.middleware("http")(limiter_middleware)
 
-# 5) Rutas protegidas (requieren JWT):
-jwt_dep = [Depends(get_current_user)]
-api_app.include_router(users_router,    tags=["Users"],    dependencies=jwt_dep)
-api_app.include_router(payments_router, prefix="/payments", tags=["Payments"], dependencies=jwt_dep)
-api_app.include_router(charging_router, tags=["Charging"], dependencies=jwt_dep)
-api_app.include_router(admin_router,    prefix="/admin",    tags=["Admin"],    dependencies=jwt_dep)
-api_app.include_router(connectors_router, tags=["Connectors"], dependencies=jwt_dep)
+    # 3) Auth: register, login, me…
+    api_app.include_router(auth_router, prefix="/auth", tags=["Auth"])
 
-# Root
-@api_app.get("/")
-def root():
-    """Punto de salud de la API REST."""
-    return {"message": "API OCPP y WebSocket Activos"}
+    # 4) Facilities públicas (GET list/detail sin token)
+    api_app.include_router(
+        facilities_router,
+        prefix="/facilities",
+        tags=["Facilities"],
+    )
+
+    # 5) Rutas protegidas (requieren JWT):
+    jwt_dep = [Depends(get_current_user)]
+    api_app.include_router(users_router,      tags=["Users"],      dependencies=jwt_dep)
+    api_app.include_router(payments_router,   prefix="/payments", tags=["Payments"], dependencies=jwt_dep)
+    api_app.include_router(charging_router,   tags=["Charging"],   dependencies=jwt_dep)
+    api_app.include_router(admin_router,      prefix="/admin",    tags=["Admin"],    dependencies=jwt_dep)
+    api_app.include_router(connectors_router, tags=["Connectors"], dependencies=jwt_dep)
+
+    # Root
+    @api_app.get("/")
+    def root():
+        """Punto de salud de la API REST."""
+        return {"message": "API OCPP y WebSocket Activos"}
 
 # WebSocket...
 async def handle_connection(websocket, path):
@@ -120,7 +121,7 @@ def start_rest_api():
 
 if __name__ == "__main__":
     # Permite ejecutar solo REST o solo WS en entornos como Railway.
-    run_mode = os.getenv("RUN_MODE", "both").lower()
+    run_mode = RUN_MODE
     if run_mode == "rest":
         start_rest_api()
     elif run_mode == "ws":
