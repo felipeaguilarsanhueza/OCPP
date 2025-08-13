@@ -1,0 +1,1518 @@
+# main.py
+
+import ocpp.messages
+ocpp.messages._skip_schema_validation = True
+
+import asyncio
+import logging
+import threading
+
+import uvicorn
+import websockets
+import ocpp
+
+from fastapi import FastAPI, Depends
+from fastapi.middleware.cors import CORSMiddleware
+
+from database.db import engine
+from database.models import Base
+
+from core.ocpp_handler       import ChargePoint
+from core.connection_manager import manager
+from core.auth               import get_current_user
+
+from api.middleware.rate_limit import limiter_middleware
+
+# Routers (todos ellos definen solo `router = APIRouter()` sin prefix interno)
+from api.routes.auth       import router as auth_router
+from api.routes.users      import router as users_router
+from api.routes.payments   import router as payments_router
+from api.routes.charging   import router as charging_router
+from api.routes.admin      import router as admin_router
+from api.routes.facilities import router as facilities_router
+from api.routes.connectors import router as connectors_router
+
+# -------------------- Skip OCPP schema validation
+ocpp.messages._skip_schema_validation = True
+
+# -------------------- Logging & DB init
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("main")
+# Silenciar logs demasiado verbosos de bcrypt
+logging.getLogger("passlib.handlers.bcrypt").setLevel(logging.ERROR)
+
+# Crear tablas si no existen (en prod, usa Alembic)
+Base.metadata.create_all(bind=engine)
+
+# -------------------- FastAPI REST
+api_app = FastAPI(title="OCPP Server API", version="1.0")
+
+# 1) CORS — debe ir antes de cualquier include_router
+api_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # en producción restringe a tu dominio
+    allow_credentials=False,    # no usamos cookies de sesión
+    allow_methods=["*"],        # GET, POST, PUT, DELETE, OPTIONS…
+    allow_headers=["*"],        # Authorization, Content-Type…
+)
+
+# 2) Rate-limit
+api_app.middleware("http")(limiter_middleware)
+
+# 3) Routers no protegidos: auth (register, login, me)
+api_app.include_router(auth_router, prefix="/auth", tags=["Auth"])
+
+# 4) Routers protegidos: requieren JWT
+protected = [Depends(get_current_user)]
+api_app.include_router(users_router,      prefix="/users",      tags=["Users"],      dependencies=protected)
+api_app.include_router(payments_router,   prefix="/payments",   tags=["Payments"],   dependencies=protected)
+api_app.include_router(charging_router,   tags=["Charging"],   dependencies=protected)
+api_app.include_router(admin_router,      prefix="/admin",      tags=["Admin"],      dependencies=protected)
+api_app.include_router(facilities_router, prefix="/facilities", tags=["Facilities"], dependencies=protected)
+api_app.include_router(
+    connectors_router,
+    dependencies=[Depends(get_current_user)]
+)
+
+@api_app.get("/")
+def root():
+    return {"message": "API OCPP y WebSocket Activos"}
+
+# -------------------- WebSocket handler
+async def handle_connection(websocket, path):
+    cp_id = path.strip("/")
+    cp = ChargePoint(cp_id, websocket)
+    manager.add(cp_id, cp)
+    logger.debug(f"[handle_connection] Conexión añadida: {cp_id}")
+    try:
+        await cp.start()
+    finally:
+        manager.remove(cp_id)
+        logger.debug(f"[handle_connection] Conexión removida: {cp_id}")
+
+async def start_websocket_server():
+    logger.info("WebSocket OCPP iniciado en ws://0.0.0.0:9000")
+    async with websockets.serve(
+        handle_connection,
+        "0.0.0.0",
+        9000,
+        subprotocols=["ocpp1.6"]
+    ):
+        await asyncio.Future()  # Mantener servidor corriendo
+
+def start_rest_api():
+    uvicorn.run(api_app, host="0.0.0.0", port=8000, log_level="info")
+
+if __name__ == "__main__":
+    # Levanta la API REST en un hilo aparte
+    rest_thread = threading.Thread(target=start_rest_api, daemon=True)
+    rest_thread.start()
+    # Levanta el servidor WebSocket en el hilo principal
+    try:
+        asyncio.run(start_websocket_server())
+    except KeyboardInterrupt:
+        logger.info("Servidor detenido")
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy.orm import Session
+from database.db import SessionLocal
+from database import models
+from database.models import Operator  # Import Operator for toggle_admin
+from pydantic import BaseModel
+
+router = APIRouter()
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# 1. Listar cargadores
+@router.get("/charge_points")
+def get_charge_points(db: Session = Depends(get_db)):
+    return db.query(models.ChargePoint).all()
+
+# 2. Registrar cargador
+class ChargerCreate(BaseModel):
+    id: str
+    vendor: str
+    model: str
+
+@router.post("/charge_points")
+def register_cp(data: ChargerCreate, db: Session = Depends(get_db)):
+    existing = db.query(models.ChargePoint).filter_by(id=data.id).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Cargador ya registrado")
+
+    cp = models.ChargePoint(id=data.id, vendor=data.vendor, model=data.model)
+    db.add(cp)
+    db.commit()
+    db.refresh(cp)
+    return cp
+
+# 3. Agregar RFID
+@router.post("/whitelist")
+def add_whitelist_entry(cp_id: str, id_tag: str, db: Session = Depends(get_db)):
+    entry = models.WhitelistEntry(charge_point_id=cp_id, id_tag=id_tag)
+    db.add(entry)
+    db.commit()
+    return {"message": f"Tag {id_tag} agregado a whitelist del CP {cp_id}"}
+
+# 4. Ver whitelist
+@router.get("/whitelist/{cp_id}")
+def list_whitelist(cp_id: str, db: Session = Depends(get_db)):
+    return db.query(models.WhitelistEntry).filter_by(charge_point_id=cp_id).all()
+
+# 5. Registrar operador
+class OperatorCreate(BaseModel):
+    username: str
+    email: str
+    password_hash: str
+
+@router.post("/operators")
+def create_operator(data: OperatorCreate, db: Session = Depends(get_db)):
+    user = models.Operator(
+        username=data.username,
+        email=data.email,
+        password_hash=data.password_hash
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+# 6. Consultar sesiones de carga
+@router.get("/sessions")
+def get_sessions(db: Session = Depends(get_db)):
+    return db.query(models.ChargingSession).order_by(
+        models.ChargingSession.start_time.desc()
+    ).all()
+
+# 7. Limpieza de mensajes viejos (opcional)
+@router.delete("/cleanup/meter_values")
+def delete_old_meter_values(db: Session = Depends(get_db)):
+    from datetime import datetime, timedelta
+    threshold = datetime.utcnow() - timedelta(days=30)
+    deleted = db.query(models.OcppMessage)\
+                .filter(models.OcppMessage.action == "MeterValues")\
+                .filter(models.OcppMessage.timestamp < threshold)\
+                .delete()
+    db.commit()
+    return {"deleted": deleted}
+
+# 8. Toggle admin
+class ToggleAdminIn(BaseModel):
+    user_id: int
+    make_admin: bool
+
+@router.post("/toggle_admin")
+def toggle_admin(
+    data: ToggleAdminIn,
+    db: Session = Depends(get_db),
+    # could add admin master token dependency here
+):
+    user = db.query(Operator).filter_by(id=data.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    user.is_admin = data.make_admin
+    db.commit()
+    db.refresh(user)
+    return {"user_id": user.id, "is_admin": user.is_admin}
+# api/routes/auth.py
+
+from fastapi import APIRouter, HTTPException, Depends, status, Body
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+
+from core.auth import authenticate_user, create_access_token, get_current_user, get_db
+from api.schemas.auth import Token, UserCreate, UserOut
+from database import crud
+
+# No prefix here; it will be applied in main.py
+router = APIRouter()
+
+@router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+def register(user_in: UserCreate, db: Session = Depends(get_db)):
+    """
+    Registra un nuevo usuario y devuelve sus datos (sin contraseña).
+    """
+    if crud.get_user_by_email(db, user_in.email):
+        raise HTTPException(status_code=400, detail="Email ya registrado")
+    user = crud.create_user(
+        db,
+        email=user_in.email,
+        password=user_in.password,
+        username=user_in.username
+    )
+    return user
+
+@router.post("/login", response_model=Token)
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    """
+    Loguea al usuario y devuelve un JWT.
+    """
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales inválidas",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    access_token = create_access_token(data={"sub": user.email})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@router.get("/me", response_model=UserOut)
+def me(current_user=Depends(get_current_user)):
+    """
+    Devuelve los datos del usuario autenticado.
+    """
+    return current_user
+
+@router.post("/admin_token", summary="Genera un JWT de administrador")
+def admin_token(master_key: str = Body(..., embed=True)):
+    """
+    Recibe { "master_key": "…" } y si coincide con ADMIN_MASTER_KEY
+    devuelve un token con role=admin y expiración larga.
+    """
+    from core.auth import ADMIN_MASTER_KEY, create_admin_token
+    if master_key != ADMIN_MASTER_KEY:
+        raise HTTPException(status_code=401, detail="Clave de administrador inválida")
+    token = create_admin_token()
+    return {"access_token": token, "token_type": "bearer"}# api/routes/charging.py
+from fastapi import APIRouter, HTTPException, Body, Query, Depends
+from pydantic import BaseModel
+from ocpp.v16 import call
+from core.connection_manager import manager
+from sqlalchemy.orm import Session
+from core.auth import get_db  # Obtener sesión DB del auth module
+from database.models import PaymentIntent
+
+router = APIRouter(tags=["Charging"], prefix="/charging")
+
+class RemoteStartIn(BaseModel):
+    cp_id: str
+    connector_id: int = 1
+    id_tag: str | None = None
+    payment_intent_id: str | None = None
+
+@router.post("/remote_start")
+async def remote_start(
+    data: RemoteStartIn,
+    db: Session = Depends(get_db)
+):
+    # Valida que tengamos cp_id y al menos id_tag o payment_intent_id
+    if not data.cp_id or (not data.id_tag and not data.payment_intent_id):
+        raise HTTPException(status_code=400, detail="Debe especificar cp_id y (id_tag o payment_intent_id)")
+
+    cp = manager.get(data.cp_id)
+    if cp is None:
+        raise HTTPException(status_code=404, detail="Charge point not connected")
+
+    # Si es pago, verifica intent
+    if data.payment_intent_id and not data.id_tag:
+        pi = db.query(PaymentIntent).filter_by(intent_id=data.payment_intent_id).first()
+        if pi is None or pi.status != "paid":
+            raise HTTPException(status_code=400, detail="Payment intent inválido o no pagado")
+        effective_id_tag = data.payment_intent_id
+    else:
+        effective_id_tag = data.id_tag
+
+    # Envía payload OCPP
+    cp.allow_remote_start()
+    req = call.RemoteStartTransactionPayload(
+        id_tag=effective_id_tag,
+        connector_id=data.connector_id
+    )
+    try:
+        resp = await cp.call(req)
+        return {"status": resp.status}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/connected")
+def get_connected_charge_points():
+    return {"connected_charge_points": list(manager.all())}
+
+@router.post("/update_firmware")
+async def update_firmware(
+    cp_id: str = Body(..., embed=True),
+    location: str = Body(..., embed=True),
+    retrieve_date: str | None = Body(None, embed=True),
+):
+    # Validación
+    if not cp_id or not location:
+        raise HTTPException(status_code=400, detail="cp_id and location are required.")
+
+    cp = manager.get(cp_id)
+    if cp is None:
+        raise HTTPException(status_code=404, detail="Charge point not connected")
+
+    # Parsear fecha
+    try:
+        dt = parse_date(retrieve_date) if retrieve_date else datetime.utcnow()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid retrieve_date format")
+
+    payload = call.UpdateFirmwarePayload(
+        location=location,
+        retrieve_date=dt.isoformat()
+    )
+    try:
+        await cp.call(payload)
+        return {"status": "UpdateFirmware sent"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/remote_stop")
+async def remote_stop_transaction(
+    cp_id: str = Query(...),
+    transaction_id: int = Query(...),
+):
+    cp = manager.get(cp_id)
+    if cp is None:
+        raise HTTPException(status_code=404, detail=f"Cargador '{cp_id}' no conectado.")
+
+    payload = call.RemoteStopTransactionPayload(transaction_id=transaction_id)
+    try:
+        resp = await cp.call(payload)
+        return {"status": resp.status}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/active_transaction")
+def get_active_transaction(
+    cp_id: str = Query(...),
+    connector_id: int = Query(...),
+):
+    cp = manager.get(cp_id)
+    if cp is None:
+        raise HTTPException(status_code=404, detail="Charge point no conectado")
+
+    tx_id = cp.get_transaction_id(connector_id)
+    if tx_id is None:
+        raise HTTPException(status_code=404, detail="No hay transacción activa en ese conector.")
+
+    return {"transaction_id": tx_id}
+
+@router.post("/set_device_configuration")
+async def set_device_configuration(
+    cp_id: str = Body(..., embed=True),
+    key: str = Body(..., embed=True),
+    value: str = Body(..., embed=True),
+):
+    cp = manager.get(cp_id)
+    if cp is None:
+        raise HTTPException(status_code=404, detail=f"Cargador '{cp_id}' no está conectado")
+
+    payload = call.ChangeConfigurationPayload(key=key, value=value)
+    try:
+        resp = await cp.call(payload)
+        return {"status": resp.status}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al enviar configuración: {e}")
+
+@router.post("/whitelist")
+async def send_whitelist(
+    cp_id: str = Body(..., embed=True),
+    idtags: list[str] = Body(..., embed=True),
+    version: int = Body(1, embed=True),
+):
+    if not idtags:
+        raise HTTPException(status_code=400, detail="idtags no puede estar vacío")
+
+    cp = manager.get(cp_id)
+    if cp is None:
+        raise HTTPException(status_code=404, detail="Cargador no conectado")
+
+    local_auth_list = [{"idTag": tag} for tag in idtags]
+    payload = call.SendLocalListPayload(
+        list_version=version,
+        local_authorization_list=local_auth_list,
+        update_type="Full"
+    )
+    try:
+        resp = await cp.call(payload)
+        return {"status": resp.status}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/get_configuration")
+async def get_configuration(
+    cp_id: str = Query(...),
+    keys: str = Query("")
+):
+    cp = manager.get(cp_id)
+    if cp is None:
+        raise HTTPException(status_code=404, detail="Charge point not connected.")
+
+    key_list = keys.split(",") if keys else []
+    payload = call.GetConfigurationPayload(key=key_list)
+    try:
+        resp = await cp.call(payload)
+        return {
+            "configuration_key": resp.configuration_key,
+            "unknown_key": resp.unknown_key
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+# api/routes/connectors.py
+
+from fastapi import APIRouter, Depends, HTTPException, Path
+from typing import List
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy.orm import Session
+from database.db import SessionLocal
+from database import crud
+from database.models import Connector as ConnectorModel
+from core.auth import get_current_user
+from api.schemas.facilities import FacilityIn, FacilityOut, ChargerOut
+
+router = APIRouter(prefix="/chargers", tags=["Connectors"])
+
+class ConnectorOut(BaseModel):
+    id: int
+    charger_id: int
+    connector_number: int
+    name: str | None
+    status: str | None
+    error_code: str | None
+
+    model_config = ConfigDict(from_attributes=True)
+
+@router.get(
+    "/{charger_id}/connectors",
+    response_model=List[ConnectorOut],
+    dependencies=[Depends(get_current_user)]
+)
+def get_connectors(
+    charger_id: int = Path(..., description="ID del cargador")
+):
+    db: Session = SessionLocal()
+    try:
+        # Usa el CRUD que acabamos de definir
+        conns = crud.list_connectors(db, charger_id)
+        if conns is None:
+            raise HTTPException(404, f"Charger {charger_id} not found")
+        return conns
+    finally:
+        db.close()
+
+@router.get(
+    "/{facility_id}/chargers",
+    response_model=List[ChargerOut],  # crea un Pydantic ChargerOut si no existe
+    dependencies=[Depends(get_current_user)]
+)
+def list_chargers_by_facility(facility_id: int):
+    db = SessionLocal()
+    try:
+        chargers = crud.list_chargers_for_facility(db, facility_id)
+        if not chargers:
+            raise HTTPException(404, detail="Facility not found or no chargers")
+        return chargers
+    finally:
+        db.close()# api/routes/facilities.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List, Optional
+from pydantic import BaseModel, ConfigDict
+from datetime import datetime
+
+from core.auth import get_current_user, get_db
+from database import crud
+from database.models import Facility
+from api.schemas.facilities import FacilityIn, FacilityOut, ChargerOut
+
+router = APIRouter(
+    tags=["Facilities"],
+)
+
+# Input schema
+class FacilityIn(BaseModel):
+    name: str
+    latitude: float
+    longitude: float
+    description: Optional[str] = None
+
+# Output schema
+class FacilityOut(BaseModel):
+    id: int
+    name: str
+    latitude: float
+    longitude: float
+    description: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+@router.post(
+    "/",
+    response_model=FacilityOut,
+    status_code=201,
+)
+def create_facility(
+    data: FacilityIn,
+    db: Session = Depends(get_db),
+    _: Facility = Depends(get_current_user)
+):
+    facility = crud.create_facility(db, **data.dict())
+    return facility
+
+@router.get(
+    "/",
+    response_model=List[FacilityOut]
+)
+def list_facilities(
+    db: Session = Depends(get_db)
+):
+    return crud.list_facilities(db)
+
+@router.get(
+    "/{facility_id}",
+    response_model=FacilityOut
+)
+def get_facility(
+    facility_id: int,
+    db: Session = Depends(get_db)
+):
+    facility = crud.get_facility(db, facility_id)
+    if not facility:
+        raise HTTPException(status_code=404, detail="Facility not found")
+    return facility
+
+@router.put(
+    "/{facility_id}",
+    response_model=FacilityOut,
+)
+def update_facility(
+    facility_id: int,
+    data: FacilityIn,
+    db: Session = Depends(get_db),
+    _: Facility = Depends(get_current_user)
+):
+    facility = crud.update_facility(db, facility_id, **data.dict())
+    if not facility:
+        raise HTTPException(status_code=404, detail="Facility not found")
+    return facility
+
+@router.delete(
+    "/{facility_id}",
+    status_code=204,
+)
+def delete_facility(
+    facility_id: int,
+    db: Session = Depends(get_db),
+    _: Facility = Depends(get_current_user)
+):
+    success = crud.delete_facility(db, facility_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Facility not found")
+    return None
+
+@router.get(
+    "/{facility_id}/chargers",
+    response_model=List[ChargerOut],
+    dependencies=[Depends(get_current_user)]
+)
+def list_chargers_by_facility(
+    facility_id: int,
+    db: Session = Depends(get_db)
+):
+    # 1) Chequear que la facility existe
+    facility = crud.get_facility(db, facility_id)
+    if not facility:
+        raise HTTPException(status_code=404, detail="Facility not found")
+
+    # 2) Traer todos los chargers (puede devolver lista vacía)
+    chargers = crud.list_chargers_for_facility(db, facility_id)
+    return chargersfrom fastapi import APIRouter, HTTPException, Depends
+from core.auth import get_current_user
+
+router = APIRouter(prefix="/payments", tags=["Payments"])
+
+@router.post("/create_intent", dependencies=[Depends(get_current_user)])
+async def create_payment_intent():
+    # Lógica de pagos con MercadoPago pendiente de implementar
+    raise HTTPException(
+        status_code=501,
+        detail="Integración con MercadoPago aún no implementada"
+    )
+
+@router.get("/status/{payment_id}", dependencies=[Depends(get_current_user)])
+async def payment_status(payment_id: str):
+    raise HTTPException(
+        status_code=501,
+        detail="Integración con MercadoPago aún no implementada"
+    )
+
+@router.get("/history", dependencies=[Depends(get_current_user)])
+async def payment_history():
+    raise HTTPException(
+        status_code=501,
+        detail="Integración con MercadoPago aún no implementada"
+    )from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict
+from typing import List
+from sqlalchemy.orm import Session
+from core.auth import get_current_user, get_db
+from database import crud
+
+router = APIRouter(prefix="/users", tags=["Users"])
+
+class UpdateProfileIn(BaseModel):
+    username: str
+
+class ProfileOut(BaseModel):
+    id: int
+    email: str
+    username: str
+    rfid_tags: List[str] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+class RFIDTagIn(BaseModel):
+    id_tag: str
+
+class RFIDTagOut(BaseModel):
+    id_tag: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+@router.get("/profile", response_model=ProfileOut)
+def get_profile(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Obtiene el perfil del usuario autenticado, incluyendo sus etiquetas RFID.
+    """
+    user = crud.get_user(db, current_user.id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    tags = [tag.id_tag for tag in user.rfid_tags]
+    return ProfileOut(
+        id=user.id,
+        email=user.email,
+        username=user.username,
+        rfid_tags=tags
+    )
+
+@router.put("/profile", response_model=ProfileOut)
+def update_profile(
+    data: UpdateProfileIn,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Actualiza el nombre de usuario del perfil autenticado.
+    """
+    user = crud.update_user_name(db, current_user.id, data.username)
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    tags = [tag.id_tag for tag in user.rfid_tags]
+    return ProfileOut(
+        id=user.id,
+        email=user.email,
+        username=user.username,
+        rfid_tags=tags
+    )
+
+@router.get("/history", response_model=List[dict])
+def payment_history(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Lista el historial de pagos asociados al usuario.
+    """
+    return crud.list_payments_for_user(db, current_user.id)
+
+@router.get("/rfid", response_model=List[str])
+def list_rfid_tags(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Lista las etiquetas RFID registradas por el usuario.
+    """
+    tags = crud.list_rfid_tags_for_user(db, current_user.id)
+    return [tag.id_tag for tag in tags]
+
+@router.post("/rfid", response_model=RFIDTagOut, status_code=201)
+def add_rfid_tag(
+    tag_in: RFIDTagIn,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Agrega una nueva etiqueta RFID al usuario autenticado.
+    """
+    tag = crud.add_rfid_tag_to_user(db, current_user.id, tag_in.id_tag)
+    return RFIDTagOut(id_tag=tag.id_tag)
+from pydantic import BaseModel, EmailStr, Field
+from pydantic import ConfigDict
+from typing import Optional
+from datetime import datetime
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class TokenData(BaseModel):
+    """Datos contenidos en el token JWT."""
+    email: Optional[EmailStr] = None
+
+
+class UserCreate(BaseModel):
+    """
+    Datos para registro de nuevo usuario.
+    Acepta 'name' en el body y lo asigna a username.
+    """
+    email: EmailStr
+    password: str
+    username: str = Field(..., alias="name")
+
+    # Permitir poblar usando el alias 'name'
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class UserOut(BaseModel):
+    """
+    Respuesta tras registro o consulta de usuario.
+    """
+    id: int
+    email: EmailStr
+    username: str
+    created_at: Optional[datetime]
+
+    # Habilita ORM mode para Pydantic v2
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserInDB(UserOut):
+    """
+    Modelo de usuario interno, incluye el hash de contraseña.
+    """
+    password_hash: str
+
+
+class UserLogin(BaseModel):
+    """
+    Datos de login (form-data).
+    """
+    username: EmailStr
+    password: str
+
+    model_config = ConfigDict(from_attributes=True)
+from pydantic import BaseModel, ConfigDict
+
+class ConnectorOut(BaseModel):
+    connector_number: int
+    name: str | None
+    status: str | None
+    error_code: str | None
+
+    model_config = ConfigDict(from_attributes=True)
+from typing import List, Optional
+from pydantic import BaseModel, ConfigDict
+from datetime import datetime
+
+# --- Facility schemas (ya los tenías, los repito por contexto) ---
+
+class FacilityIn(BaseModel):
+    name: str
+    latitude: float
+    longitude: float
+    description: Optional[str] = None
+
+class FacilityOut(BaseModel):
+    id: int
+    name: str
+    latitude: float
+    longitude: float
+    description: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --- Nuevo: Charger schema para listar chargers de una facility ---
+
+class ChargerOut(BaseModel):
+    id: int
+    code: str
+    brand: Optional[str] = None
+    charger_model: Optional[str] = None
+    location: Optional[str] = None
+    facility_id: Optional[int] = None
+
+    model_config = ConfigDict(from_attributes=True)# core/auth.py
+
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.orm import Session
+
+from database.db import SessionLocal
+from database.models import Operator
+from config.settings import settings
+
+dpwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+ALGORITHM = settings.ALGORITHM
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.ACCESS_TOKEN_EXPIRE_MINUTES
+SECRET_KEY = settings.SECRET_KEY
+
+# Leer tu clave maestra y caducidad de admin del .env
+ADMIN_MASTER_KEY = settings.ADMIN_MASTER_KEY
+ADMIN_TOKEN_EXPIRE_DAYS = settings.ADMIN_TOKEN_EXPIRE_DAYS
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return dpwd_context.verify(plain_password, hashed_password)
+
+def authenticate_user(db: Session, email: str, password: str) -> Optional[Operator]:
+    user = db.query(Operator).filter_by(email=email).first()
+    if not user or not verify_password(password, user.password_hash):
+        return None
+    return user
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> Operator:
+    # 1) Chequea si es tu master admin key
+    if token == ADMIN_MASTER_KEY:
+        # Puedes devolver aquí un objeto Operator «fantasma» con is_admin=True
+        fake_admin = Operator(
+            id=0,
+            username="__admin__",
+            email="admin@local",
+            password_hash="",
+            is_admin=True
+        )
+        return fake_admin
+
+    # 2) Si no, decodifica como JWT normal
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="No se pudieron validar las credenciales",
+        headers={"WWW-Authenticate": "Bearer"}
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if not email:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(Operator).filter_by(email=email).first()
+    if not user:
+        raise credentials_exception
+    return user
+
+
+def get_current_admin(
+    current_user: Operator = Depends(get_current_user)
+) -> Operator:
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Se requieren permisos de administrador"
+        )
+    return current_user
+
+def get_user_or_admin(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+) -> Operator:
+    """
+    Acepta token válido de usuario normal o administrador.
+    """
+    # 1) Intenta autenticar usuario “normal”
+    try:
+        user = get_current_user(token=token, db=db)
+        return user
+    except HTTPException as e:
+        # Si fue un 401, intenta admin
+        if e.status_code == status.HTTP_401_UNAUTHORIZED:
+            admin = get_current_admin(token=token, db=db)
+            return admin
+        raise efrom sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Float, Text, Boolean
+from sqlalchemy.orm import relationship, declarative_base
+from sqlalchemy.dialects.postgresql import JSONB
+from datetime import datetime
+
+Base = declarative_base()
+
+
+class Charger(Base):
+    __tablename__ = "chargers"
+    
+    id = Column(Integer, primary_key=True)
+    code = Column(String(50), nullable=False, unique=True, index=True)
+    brand = Column(String(50), nullable=True)
+    box_serial_number = Column(String(100), nullable=True)
+    name = Column(String(100), nullable=True)
+    location = Column(String(200), nullable=True)
+    admin_status = Column(String(50), nullable=True)
+    proxy_status = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relaciones
+    connectors = relationship("Connector", back_populates="charger", cascade="all, delete-orphan")
+    transactions = relationship("ChargeTransaction", back_populates="charger", cascade="all, delete-orphan")
+    log_ocpp = relationship("LogOcpp", back_populates="charger", cascade="all, delete-orphan")
+    log_ocpp_proxy_connections = relationship(
+        "LogOcppProxyConnection", back_populates="charger", cascade="all, delete-orphan"
+    )
+    heartbeat_logs = relationship("HeartbeatLog", back_populates="charger", cascade="all, delete-orphan")
+    facility_id = Column(Integer, ForeignKey("facilities.id"), nullable=True)
+
+
+class Connector(Base):
+    __tablename__ = "connectors"
+    
+    id = Column(Integer, primary_key=True)
+    charger_id = Column(Integer, ForeignKey("chargers.id"), nullable=False)
+    connector_number = Column(Integer, nullable=False)
+    name = Column(String(100), nullable=True)
+    status = Column(String(50), nullable=True)
+    error_code = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relaciones
+    charger = relationship("Charger", back_populates="connectors")
+    transactions = relationship("ChargeTransaction", back_populates="connector", cascade="all, delete-orphan")
+    log_ocpp = relationship("LogOcpp", back_populates="connector", cascade="all, delete-orphan")
+    log_ocpp_proxy_connections = relationship(
+        "LogOcppProxyConnection", back_populates="connector", cascade="all, delete-orphan"
+    )
+
+
+class ChargeTransaction(Base):
+    __tablename__ = "charge_transactions"
+    
+    id = Column(Integer, primary_key=True)
+    charger_id = Column(Integer, ForeignKey("chargers.id"), nullable=False)
+    connector_id = Column(Integer, ForeignKey("connectors.id"), nullable=False)
+    transaction_id = Column(Integer, nullable=True)
+    start_time = Column(DateTime, default=datetime.utcnow)
+    end_time = Column(DateTime, nullable=True)
+    delivered_energy = Column(Float, nullable=True)
+    user_id = Column(Integer, nullable=True)
+    meter_start = Column(Float, nullable=True)
+    meter_stop = Column(Float, nullable=True)
+    net_energy = Column(Float, nullable=True)
+    status = Column(String(50), nullable=True)
+    id_tag = Column(String(100), nullable=True)
+    
+    # Relaciones
+    charger = relationship("Charger", back_populates="transactions")
+    connector = relationship("Connector", back_populates="transactions")
+    meter_values = relationship("MeterValue", back_populates="transaction", cascade="all, delete-orphan")
+
+
+class MeterValue(Base):
+    __tablename__ = "meter_values_logs"
+    
+    id = Column(Integer, primary_key=True)
+    meter_date = Column(DateTime, default=datetime.utcnow)
+    value = Column(Float, nullable=True)
+    context = Column(String(100), nullable=True)
+    format = Column(String(50), nullable=True)
+    measurand = Column(String(100), nullable=True)
+    phase = Column(String(50), nullable=True)
+    unit = Column(String(20), nullable=True)
+    transaction_id = Column(Integer, ForeignKey("charge_transactions.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relaciones
+    transaction = relationship("ChargeTransaction", back_populates="meter_values")
+
+
+class MeterValue15min(Base):
+    __tablename__ = "meter_values_15min_logs"
+    
+    id = Column(Integer, primary_key=True)
+    meter_date = Column(DateTime, default=datetime.utcnow)
+    meter_value = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PartitionHistory(Base):
+    __tablename__ = "partition_history"
+    
+    id = Column(Integer, primary_key=True)
+    table_name = Column(String(100), nullable=False)
+    partition_start = Column(DateTime, nullable=False)
+    partition_end = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LogOcpp(Base):
+    __tablename__ = "log_ocpp"
+    
+    id = Column(Integer, primary_key=True)
+    charger_id = Column(Integer, ForeignKey("chargers.id"), nullable=True)
+    connector_id = Column(Integer, ForeignKey("connectors.id"), nullable=True)
+    transaction_id = Column(Integer, nullable=True)
+    message_type = Column(String(50), nullable=True)
+    action = Column(String(50), nullable=True)
+    payload = Column(JSONB, nullable=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    
+    # Relaciones
+    charger = relationship("Charger", back_populates="log_ocpp")
+    connector = relationship("Connector", back_populates="log_ocpp")
+
+
+class LogOcppDuplicatedIDs(Base):
+    __tablename__ = "log_ocpp_duplicated_ids"
+    
+    id = Column(Integer, primary_key=True)
+    unique_id = Column(String(100), nullable=False)
+    event_timestamp = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LogOcppProxyConnection(Base):
+    __tablename__ = "log_ocpp_proxy_connection"
+    
+    id = Column(Integer, primary_key=True)
+    charger_id = Column(Integer, ForeignKey("chargers.id"), nullable=True)
+    connector_id = Column(Integer, ForeignKey("connectors.id"), nullable=True)
+    action = Column(String(50), nullable=True)
+    error_code = Column(String(50), nullable=True)
+    error_message = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relaciones
+    charger = relationship("Charger", back_populates="log_ocpp_proxy_connections")
+    connector = relationship("Connector", back_populates="log_ocpp_proxy_connections")
+
+
+class Operator(Base):
+    __tablename__ = "operators"
+    id           = Column(Integer, primary_key=True)
+    email        = Column(String, unique=True, nullable=False)
+    username     = Column(String, nullable=False)
+    password_hash= Column(String, nullable=False)
+    is_admin     = Column(Boolean, default=False, nullable=False)   # ← nuevo
+    created_at   = Column(DateTime, default=datetime.utcnow)
+    updated_at   = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relaciones
+    rfid_tags = relationship("RFIDTag", back_populates="user", cascade="all, delete-orphan")
+    payment_intents = relationship("PaymentIntent", back_populates="user", cascade="all, delete-orphan")
+
+
+class RFIDTag(Base):
+    __tablename__ = "rfid_tags"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("operators.id"), nullable=False)
+    id_tag = Column(String(100), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("Operator", back_populates="rfid_tags")
+
+
+class PaymentIntent(Base):
+    __tablename__ = "payment_intents"
+
+    id = Column(Integer, primary_key=True)
+    intent_id = Column(String(100), unique=True, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("operators.id"), nullable=False)
+    charger_code = Column(String(50), nullable=False)
+    amount = Column(Float, nullable=False)
+    status = Column(String(50), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("Operator", back_populates="payment_intents")
+
+
+class HeartbeatLog(Base):
+    __tablename__ = "heartbeat_logs"
+    
+    id = Column(Integer, primary_key=True)
+    charger_id = Column(Integer, ForeignKey("chargers.id"), nullable=True)
+    connector_id = Column(Integer, nullable=True)
+    reported_time = Column(DateTime, nullable=True)
+    received_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    payload = Column(JSONB, nullable=True)
+    
+    charger = relationship("Charger", back_populates="heartbeat_logs")
+
+class Facility(Base):
+    __tablename__ = "facilities"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), nullable=False, unique=True, index=True)
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    description = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relaciones
+    chargers = relationship("Charger", backref="facility", lazy="dynamic")
+import logging
+from datetime import datetime
+from sqlalchemy.orm import Session
+from passlib.context import CryptContext
+from database.db import SessionLocal
+from database.models import (
+    Charger, Connector, ChargeTransaction, MeterValue, LogOcpp, HeartbeatLog,
+    Operator, RFIDTag, PaymentIntent, Facility
+)
+
+logger = logging.getLogger("ocpp")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# ---------------------
+# OCPP CRUD FUNCTIONS
+# ---------------------
+
+def ensure_charger_exists(code, brand=None, charger_model=None, location=None):
+    db = SessionLocal()
+    try:
+        charger = db.query(Charger).filter_by(code=code).first()
+        if not charger:
+            charger = Charger(
+                code=code,
+                brand=brand or "Unknown",
+                charger_model=charger_model or "Unknown",
+                location=location or ""
+            )
+            db.add(charger)
+            db.commit()
+            db.refresh(charger)
+        return charger
+    except Exception as e:
+        logger.error(f"Error ensuring charger '{code}': {e}")
+        db.rollback()
+        return None
+    finally:
+        db.close()
+
+
+def ensure_connector_exists(charger_id: int, connector_number: int):
+    db = SessionLocal()
+    try:
+        connector = db.query(Connector).filter_by(
+            charger_id=charger_id,
+            connector_number=connector_number
+        ).first()
+        if not connector:
+            connector = Connector(
+                charger_id=charger_id,
+                connector_number=connector_number
+            )
+            db.add(connector)
+            db.commit()
+            db.refresh(connector)
+        return connector
+    except Exception as e:
+        logger.error(f"Error ensuring connector {connector_number} for charger {charger_id}: {e}")
+        db.rollback()
+        return None
+    finally:
+        db.close()
+
+
+def create_charge_transaction(charger_id, connector_id, id_tag, meter_start, timestamp):
+    db = SessionLocal()
+    try:
+        tx = ChargeTransaction(
+            charger_id=charger_id,
+            connector_id=connector_id,
+            id_tag=id_tag,
+            meter_start=meter_start,
+            start_time=datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        )
+        db.add(tx)
+        db.commit()
+        db.refresh(tx)
+        tx.transaction_id = tx.id
+        db.commit()
+        return tx.id
+    except Exception as e:
+        logger.error(f"Error creating charge transaction: {e}")
+        db.rollback()
+        return None
+    finally:
+        db.close()
+
+
+def stop_charge_transaction(transaction_id, meter_stop, timestamp):
+    db = SessionLocal()
+    try:
+        tx = db.query(ChargeTransaction).filter_by(id=transaction_id).first()
+        if tx:
+            tx.meter_stop = meter_stop
+            tx.end_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            db.commit()
+        return tx
+    except Exception as e:
+        logger.error(f"Error stopping transaction {transaction_id}: {e}")
+        db.rollback()
+        return None
+    finally:
+        db.close()
+
+
+def log_ocpp_message(
+    db: Session,
+    charger_id: int,
+    connector_id: int | None,
+    transaction_id: int | None = None,
+    payload: dict | None = None,
+    action: str = "MeterValues",
+    message_type: str = "Request"
+) -> LogOcpp:
+    """
+    Inserta un registro en la tabla log_ocpp.
+    - `db` debe ser un Session inyectada (p.ej. Depends(get_db)).
+    - `payload` tiene que ser JSON-serializable.
+    """
+    entry = LogOcpp(
+        charger_id=charger_id,
+        connector_id=connector_id,
+        transaction_id=transaction_id,
+        message_type=message_type,
+        action=action,
+        payload=payload,
+        timestamp=datetime.utcnow()  # opcional si ya tienes default en el modelo
+    )
+    try:
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+        return entry
+    except Exception:
+        db.rollback()
+        raise  # o captura y loguea, según convenga
+
+
+def log_ocpp_meter_values(charger_id, connector_id, transaction_id, meter_values):
+    db = SessionLocal()
+    try:
+        for entry in meter_values:
+            ts = datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))
+            sampled = entry.get("sampledValue") or entry.get("sampled_value", [])
+            for sv in sampled:
+                mv = MeterValue(
+                    meter_date=ts,
+                    value=float(sv["value"]),
+                    context=sv.get("context"),
+                    format=sv.get("format"),
+                    measurand=sv.get("measurand"),
+                    phase=sv.get("phase"),
+                    unit=sv.get("unit"),
+                    transaction_id=transaction_id
+                )
+                db.add(mv)
+        db.commit()
+    except Exception as e:
+        logger.error(f"Error saving meter values: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+def log_heartbeat(charger_id, connector_id, reported_time=None, payload=None):
+    db = SessionLocal()
+    try:
+        hb = HeartbeatLog(
+            charger_id=charger_id,
+            connector_id=connector_id,
+            reported_time=reported_time,
+            payload=payload
+        )
+        db.add(hb)
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+    def list_connectors(db: Session, charger_id: int) -> list[Connector]:
+        return db.query(Connector).filter_by(charger_id=charger_id).all()
+    
+
+# ---------------------
+# USER & AUTH CRUD
+# ---------------------
+
+def get_user_by_email(db, email: str):
+    return db.query(Operator).filter_by(email=email).first()
+
+
+def create_user(db, email: str, password: str, name: str):
+    hashed = pwd_context.hash(password)
+    user = Operator(username=name, email=email, password_hash=hashed)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def get_user(db, user_id: int):
+    return db.query(Operator).filter_by(id=user_id).first()
+
+
+def update_user_name(db, user_id: int, new_name: str):
+    user = get_user(db, user_id)
+    if user:
+        user.username = new_name
+        db.commit()
+        db.refresh(user)
+    return user
+
+
+def list_rfid_tags_for_user(db, user_id: int):
+    return db.query(RFIDTag).filter_by(user_id=user_id).all()
+
+
+def add_rfid_tag_to_user(db, user_id: int, id_tag: str):
+    tag = RFIDTag(user_id=user_id, id_tag=id_tag)
+    db.add(tag)
+    db.commit()
+    db.refresh(tag)
+    return tag
+
+
+# ---------------------
+# PAYMENT CRUD
+# ---------------------
+
+def save_payment_intent(db, intent_id: str, user_id: int, charger_code: str, amount: float):
+    pi = PaymentIntent(
+        intent_id=intent_id,
+        user_id=user_id,
+        charger_code=charger_code,
+        amount=amount,
+        status="created",
+        created_at=datetime.utcnow()
+    )
+    db.add(pi)
+    db.commit()
+    db.refresh(pi)
+    return pi
+
+
+def list_payments_for_user(db, user_id: int):
+    return db.query(PaymentIntent).filter_by(user_id=user_id).all()
+
+
+def update_payment_intent_status(db, intent_id: str, status: str):
+    pi = db.query(PaymentIntent).filter_by(intent_id=intent_id).first()
+    if pi:
+        pi.status = status
+        db.commit()
+        db.refresh(pi)
+    return pi
+
+# Facilities
+def create_facility(db, name: str, latitude: float, longitude: float, description: str | None = None):
+    facility = Facility(
+        name=name,
+        latitude=latitude,
+        longitude=longitude,
+        description=description,
+    )
+    db.add(facility)
+    db.commit()
+    db.refresh(facility)
+    return facility
+
+def get_facility(db, facility_id: int):
+    return db.query(Facility).filter(Facility.id == facility_id).first()
+
+def list_facilities(db):
+    return db.query(Facility).order_by(Facility.name).all()
+
+def update_facility(db, facility_id: int, **updates):
+    facility = get_facility(db, facility_id)
+    if not facility:
+        return None
+    for key, value in updates.items():
+        setattr(facility, key, value)
+    db.commit()
+    db.refresh(facility)
+    return facility
+
+def delete_facility(db, facility_id: int):
+    facility = get_facility(db, facility_id)
+    if facility:
+        db.delete(facility)
+        db.commit()
+    return facility
+
+def list_connectors(db: Session, charger_id: int) -> list[Connector]:
+    return (
+        db.query(Connector)
+          .filter_by(charger_id=charger_id)
+          .order_by(Connector.connector_number)
+          .all()
+    )
+
+def list_chargers_for_facility(db: Session, facility_id: int):
+    return (
+        db.query(Charger)
+          .filter_by(facility_id=facility_id)
+          .order_by(Charger.code)
+          .all()
+    )from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    SECRET_KEY: str
+    ALGORITHM: str
+    ACCESS_TOKEN_EXPIRE_MINUTES: int
+
+    ADMIN_MASTER_KEY: str
+    ADMIN_TOKEN_EXPIRE_DAYS: int
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
