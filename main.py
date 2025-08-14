@@ -71,8 +71,8 @@ class ASGILogWrapper:
                 )
         return await self.app(scope, receive, send)
 
-# envolver app con el logger de scopes
-app = ASGILogWrapper(app)
+# preparar app ASGI con logger de scopes (no sustituye el objeto FastAPI)
+asgi_app = ASGILogWrapper(app)
 
 # 1) CORS
 app.add_middleware(
@@ -188,7 +188,7 @@ async def ocpp_http_probe(cp_id: str, request: Request):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))  # Railway inyecta $PORT
     uvicorn.run(
-        app,
+        asgi_app,
         host="0.0.0.0",
         port=port,
         log_level="info",
