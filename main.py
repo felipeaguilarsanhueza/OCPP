@@ -23,7 +23,7 @@ Base.metadata.create_all(bind=engine)
 # =========================
 # FastAPI (REST + WebSocket)
 # =========================
-from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.middleware.rate_limit import limiter_middleware
@@ -92,19 +92,65 @@ class FastAPIWebSocketAdapter:
 
 @app.websocket("/ocpp/{cp_id}")
 async def ocpp_ws(websocket: WebSocket, cp_id: str):
-    # Importante: aceptar anunciando el subprotocolo OCPP
-    # El cliente debe enviar Sec-WebSocket-Protocol: ocpp1.6
+    """Endpoint WebSocket OCPP 1.6 con logs detallados de intentos.
+
+    - Rechaza si el cliente no ofrece el subprotocolo `ocpp1.6`.
+    - Registra IP/puerto, headers relevantes y cp_id.
+    """
+    client = websocket.client or ("?", "?")
+    headers_dict = {k.decode() if isinstance(k, (bytes, bytearray)) else k: (
+        v.decode() if isinstance(v, (bytes, bytearray)) else v
+    ) for k, v in websocket.headers.items()} if hasattr(websocket, "headers") else {}
+    offered_protocols_raw = headers_dict.get("sec-websocket-protocol") or headers_dict.get("Sec-WebSocket-Protocol")
+    offered = [p.strip().lower() for p in offered_protocols_raw.split(',')] if offered_protocols_raw else []
+
+    logger.info(
+        f"[WS Attempt] cp_id={cp_id} from={client} offered_protocols={offered} "
+        f"ua={headers_dict.get('user-agent')}"
+    )
+
+    if "ocpp1.6" not in offered:
+        logger.warning(f"[WS Reject] cp_id={cp_id} motivo=missing-subprotocol offered={offered}")
+        # 1002 (protocol error) o 1003 (unsupported data). Elegimos 1002
+        await websocket.close(code=1002)
+        return
+
+    # Aceptar negociando explícitamente ocpp1.6
     await websocket.accept(subprotocol="ocpp1.6")
+    logger.info(f"[WS Accept] cp_id={cp_id} subprotocol=ocpp1.6 from={client}")
+
     adapter = FastAPIWebSocketAdapter(websocket)
-    cp = ChargePoint(cp_id, adapter)   # ChargePoint debe trabajar con .send/.recv/.close
+    cp = ChargePoint(cp_id, adapter)
     manager.add(cp_id, cp)
-    logger.info(f"OCPP conectado: {cp_id}")
     try:
-        await cp.start()  # tu loop OCPP
+        await cp.start()
     except WebSocketDisconnect:
-        logger.info(f"OCPP desconectado: {cp_id}")
+        logger.info(f"[WS Close] cp_id={cp_id} disconnected by client")
+    except Exception as exc:
+        logger.exception(f"[WS Error] cp_id={cp_id} error={type(exc).__name__}: {exc}")
     finally:
         manager.remove(cp_id)
+
+@app.get("/ocpp/{cp_id}")
+async def ocpp_http_probe(cp_id: str, request: Request):
+    """Ruta HTTP espejo para registrar intentos vía HTTP en lugar de WS.
+
+    Útil para ver 499/40x en el proxy y confirmar que el cliente no está
+    haciendo WebSocket upgrade. Devuelve 426 con detalles.
+    """
+    client = (request.client.host, request.client.port) if request.client else ("?", "?")
+    ua = request.headers.get("user-agent")
+    upgrade = request.headers.get("upgrade")
+    ws_proto = request.headers.get("sec-websocket-protocol")
+    logger.info(f"[HTTP Probe] cp_id={cp_id} from={client} upgrade={upgrade} subprotocol={ws_proto} ua={ua}")
+    return {
+        "detail": "Use WebSocket wss://<host>/ocpp/{cp_id} con subprotocolo ocpp1.6",
+        "cp_id": cp_id,
+        "client": client,
+        "upgrade": upgrade,
+        "offered_subprotocol": ws_proto,
+        "hint": "Configure el cliente para enviar Sec-WebSocket-Protocol: ocpp1.6"
+    }
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))  # Railway inyecta $PORT
