@@ -340,13 +340,17 @@ class ChargePoint(BaseChargePoint):
         if connector_id == 0:
             return call_result.StatusNotificationPayload()
 
-        # Log en BD
+        # Asegurar que exista un registro de conector y obtener su ID de BD
+        connector_rec = crud.ensure_connector_exists(self.db_charger_id, connector_id)
+        connector_db_id = connector_rec.id if connector_rec else None
+
+        # Log en BD usando el ID de conector real (evita FK violation)
         db = SessionLocal()
         try:
             crud.log_ocpp_message(
                 db,
                 charger_id=self.db_charger_id,
-                connector_id=connector_id,
+                connector_id=connector_db_id,
                 transaction_id=None,
                 payload={"errorCode": error_code, "status": status, "info": kwargs.get("info")},
                 action="StatusNotification"
@@ -361,7 +365,7 @@ class ChargePoint(BaseChargePoint):
             ts_now = datetime.utcnow().isoformat()
             placeholder_tx = crud.create_charge_transaction(
                 charger_id=self.db_charger_id,
-                connector_id=connector_id,
+                connector_id=connector_db_id,
                 id_tag=None,
                 meter_start=0,
                 timestamp=ts_now

@@ -164,6 +164,43 @@ async def ocpp_ws(websocket: WebSocket, cp_id: str):
     finally:
         manager.remove(cp_id)
 
+@app.websocket("/ocpp/")
+async def ocpp_ws_trailing(websocket: WebSocket):
+    """Compatibilidad: aceptar /ocpp/ sin CPID embebido.
+
+    Algunos cargadores no permiten configurar un path con CPID embebido y
+    envían la identidad en un header propietario o como `chargeBoxSerialNumber`
+    en BootNotification. Aquí usamos una identidad temporal hasta recibir Boot.
+    """
+    client = websocket.client or ("?", "?")
+    # Validar subprotocolo
+    offered = []
+    try:
+        offered_raw = websocket.headers.get("sec-websocket-protocol") if hasattr(websocket, "headers") else None
+        offered = [p.strip().lower() for p in offered_raw.split(',')] if offered_raw else []
+    except Exception:
+        offered = []
+    if "ocpp1.6" not in offered:
+        logger.warning(f"[WS Reject] cp_id=? motivo=missing-subprotocol offered={offered}")
+        await websocket.close(code=1002)
+        return
+
+    await websocket.accept(subprotocol="ocpp1.6")
+    temp_id = f"UNKNOWN-{client[0]}"
+    logger.info(f"[WS Accept] cp_id={temp_id} (sin path) from={client}")
+
+    adapter = FastAPIWebSocketAdapter(websocket)
+    cp = ChargePoint(temp_id, adapter)
+    manager.add(temp_id, cp)
+    try:
+        await cp.start()
+    except WebSocketDisconnect:
+        logger.info(f"[WS Close] cp_id={temp_id} disconnected by client")
+    except Exception as exc:
+        logger.exception(f"[WS Error] cp_id={temp_id} error={type(exc).__name__}: {exc}")
+    finally:
+        manager.remove(temp_id)
+
 @app.get("/ocpp/{cp_id}")
 async def ocpp_http_probe(cp_id: str, request: Request):
     """Ruta HTTP espejo para registrar intentos vía HTTP en lugar de WS.

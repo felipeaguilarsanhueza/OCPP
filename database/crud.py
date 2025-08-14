@@ -23,7 +23,11 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # ---------------------
 
 def ensure_charger_exists(code, brand=None, charger_model=None, location=None):
-    """Asegura que exista un registro `Charger` para el `code` dado."""
+    """Asegura que exista un registro `Charger` para el `code` dado`.
+
+    Nota: el modelo `Charger` no tiene campo `charger_model`. Guardamos el
+    modelo en el campo `name` para compatibilidad.
+    """
     db = SessionLocal()
     try:
         charger = db.query(Charger).filter_by(code=code).first()
@@ -31,7 +35,7 @@ def ensure_charger_exists(code, brand=None, charger_model=None, location=None):
             charger = Charger(
                 code=code,
                 brand=brand or "Unknown",
-                charger_model=charger_model or "Unknown",
+                name=charger_model or "Unknown",
                 location=location or ""
             )
             db.add(charger)
