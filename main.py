@@ -41,6 +41,39 @@ from core.connection_manager import manager
 
 app = FastAPI(title="OCPP Server API", version="1.0")
 
+# --- ASGI wrapper para loguear scopes HTTP/WS antes de que los maneje FastAPI
+class ASGILogWrapper:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        stype = scope.get("type")
+        if stype in ("http", "websocket"):
+            path = scope.get("path")
+            client = scope.get("client")
+            headers = {}
+            for k, v in (scope.get("headers") or []):
+                try:
+                    kk = k.decode() if isinstance(k, (bytes, bytearray)) else str(k)
+                    vv = v.decode() if isinstance(v, (bytes, bytearray)) else str(v)
+                    headers[kk.lower()] = vv
+                except Exception:
+                    continue
+            if stype == "websocket":
+                logger.info(
+                    f"[ASGI] WS scope path={path} client={client} upgrade={headers.get('upgrade')} "
+                    f"subprotocol={headers.get('sec-websocket-protocol')}"
+                )
+            else:
+                logger.info(
+                    f"[ASGI] HTTP scope path={path} client={client} upgrade={headers.get('upgrade')} "
+                    f"subprotocol={headers.get('sec-websocket-protocol')}"
+                )
+        return await self.app(scope, receive, send)
+
+# envolver app con el logger de scopes
+app = ASGILogWrapper(app)
+
 # 1) CORS
 app.add_middleware(
     CORSMiddleware,
@@ -154,4 +187,12 @@ async def ocpp_http_probe(cp_id: str, request: Request):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))  # Railway inyecta $PORT
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+        ws="websockets",
+    )
